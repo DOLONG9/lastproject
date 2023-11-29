@@ -1,0 +1,58 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: dong-3tier-ingress
+  namespace: donggu-ns2
+  annotations:
+    kubernetes.io/ingress.class: "nginx-2"
+spec:
+  rules:
+  - host: www.kakao-commit.site
+    http:
+      paths:
+      - path: /
+        pathType: Exact
+        backend:
+          service:
+            name: dong-nginx
+            port:
+              number: 80
+      - path: /petclinic/
+        pathType: Prefix
+        backend:
+          service:
+            name: tomcat-petclinic
+            port:
+              number: 8080
+      - path: /health-kr/
+        pathType: Prefix
+        backend:
+          service:
+            name: dong-nginx-health
+            port:
+              number: 80
+
+  - host: kakao-commit.site
+    http:
+      paths:
+      - path: /
+        pathType: Exact
+        backend:
+          service:
+            name: dong-nginx
+            port:
+              number: 80
+      - path: /petclinic/
+        pathType: Prefix
+        backend:
+          service:
+            name: tomcat-petclinic
+            port:
+              number: 8080
+      - path: /health-kr/
+        pathType: Prefix
+        backend:
+          service:
+            name: dong-nginx-health
+            port:
+              number: 80

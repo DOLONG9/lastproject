@@ -1,0 +1,37 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  namespace: donggu-ns2
+  name: tomcat-petclinic
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tomcat-petclinic
+  template:
+    metadata:
+      labels:
+        app: tomcat-petclinic
+    spec:
+      containers:
+      - name: tomcat-petclinic
+        image: donggu.ddnsking.com/test/tomcat_image:25
+        ports:
+          - containerPort: 8080
+      imagePullSecrets:
+      - name: regcred
+
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  namespace: donggu-ns2
+  name: tomcat-petclinic
+spec:
+  selector:
+    app: tomcat-petclinic  
+  ports:
+    - protocol: TCP
+      port: 8080          # 클러스터에서 서비스에 접근할 때 사용하는 포트
+  type: ClusterIP

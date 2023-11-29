@@ -1,0 +1,96 @@
+pipeline {
+    agent any
+
+    stages {
+        stage('Initialize variables') {
+            steps {
+                script {
+                    // Initialize the global variable
+                    env.desiredReplicaCount = ''
+                }
+            }
+        }
+
+        stage('replias set') {
+            steps {
+                script {                
+                    env.desiredReplicaCount = readFile('pod_replicas.txt').trim()
+                }
+            }
+        }
+        
+        stage('Set permissions') {
+            steps {
+                sh 'chmod +x ./spring-framework-petclinic_read/mvnw'
+            }
+        }
+
+
+        stage('Build with Maven') {
+            steps {
+                sh 'cd ./spring-framework-petclinic_read && ./mvnw clean package -Dmaven.test.skip=true -P MySQL'
+            }
+        }
+
+        stage('Build tomcat image') {
+            steps {
+                script {
+                    docker.withRegistry('http://its2am.servegame.com:3000/', 'harbor') {
+                        def app = docker.build("its2am.servegame.com:3000/test/tomcat_image:${env.BUILD_NUMBER}", "-f Dockerfile .")
+                        app.push()
+                    }
+                }
+            }
+        }
+
+
+        stage('Build nginx image') {
+            steps {
+                script {
+                    docker.withRegistry('http://its2am.servegame.com:3000/', 'harbor') {
+                        def customImage = docker.build("its2am.servegame.com:3000/test/nginx_image:${env.BUILD_NUMBER}", "-f Dockerfile1 .")
+                        customImage.push()
+                    }
+                }
+            }
+        }
+
+        stage('Build health-nginx image') {
+            steps {
+                script {
+                    docker.withRegistry('http://its2am.servegame.com:3000/', 'harbor') {
+                        def customImage = docker.build("its2am.servegame.com:3000/test/health_image:${env.BUILD_NUMBER}", "-f Dockerfile2 .")
+                        customImage.push()
+                    }
+                }
+            }
+        }
+
+
+        stage('Update Manifests') {
+            steps {
+                script { 
+                    git credentialsId: 'gitlab_ssh_test', url: 'ssh://git@dnshost2.ddns.net:1022/root/argo.git'
+                    
+                    // Update 3deploy1.yaml
+                    sh "sed -i 's|its2am.servegame.com/test/nginx_image:.*|its2am.servegame.com/test/nginx_image:${env.BUILD_NUMBER}|' 3deploy1_nginx.yaml"
+                    sh "sed -i 's|its2am.servegame.com/test/health_image:.*|its2am.servegame.com/test/health_image:${env.BUILD_NUMBER}|' 3deploy1_nginx.yaml"
+                    sh "sed -i 's|replicas: .*|replicas: ${desiredReplicaCount}|' 3deploy1_nginx.yaml"
+
+                    // Update 3deploy2.yaml
+                    sh "sed -i 's|its2am.servegame.com/test/tomcat_image:.*|its2am.servegame.com/test/tomcat_image:${env.BUILD_NUMBER}|' 3deploy2_tomcat.yaml"
+                    sh "sed -i 's|replicas: .*|replicas: ${desiredReplicaCount}|' 3deploy2_tomcat.yaml"
+                    
+                    sh """
+                        git config user.email "root@test.pri"
+                        git config user.name "root"
+                        git add 3deploy1_nginx.yaml
+                        git add 3deploy2_tomcat.yaml
+                        git commit -m 'Update image tag to ${env.BUILD_NUMBER}'
+                        git push --set-upstream origin master
+                    """
+                }
+            }
+        }
+    }
+} 

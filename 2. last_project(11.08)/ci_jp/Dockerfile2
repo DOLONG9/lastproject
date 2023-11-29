@@ -1,0 +1,5 @@
+# 기본 이미지로 nginx를 사용
+FROM nginx
+
+# /usr/share/nginx/html/health-kr/ 디렉토리에 필요한 파일들을 복사
+COPY ./health-jp/ /usr/share/nginx/html/health-jp/
