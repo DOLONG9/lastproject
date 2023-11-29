@@ -1,0 +1,273 @@
+#!/bin/bash
+
+# 스크립트에서 에러 발생 시 중단
+set -e
+
+# UFW 방화벽 서비스 중지 및 비활성화
+sudo systemctl stop ufw
+sudo systemctl disable ufw
+
+# AWS CLI 설치
+apt install unzip -y
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+unzip awscliv2.zip
+sudo ./aws/install
+
+# 버전 확인
+aws --version
+
+# kubectl 설치
+curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+chmod +x ./kubectl
+sudo mv ./kubectl /usr/local/bin/kubectl
+
+# 버전 확인
+kubectl version --client
+
+# Eksctl 설치
+curl --silent --location "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz" | tar xz -C /tmp
+sudo mv /tmp/eksctl /usr/local/bin
+
+# 버전 확인 
+eksctl version
+
+echo "Please enter your AWS Access Key ID:"
+read access_key
+echo "Please enter your AWS Secret Access Key:"
+read -s secret_key
+echo "Default region name [ap-northeast-1]:"
+read region
+echo "Default output format [json]:"
+read output
+
+aws configure set aws_access_key_id $access_key
+aws configure set aws_secret_access_key $secret_key
+aws configure set default.region ${region:-ap-northeast-1}
+aws configure set default.output ${output:-json}
+
+# Kubeconfig 업데이트 (클러스터 이름과 리전을 실제 값으로 변경해야 합니다.)
+echo "Please enter your eks region name:"
+read eks_region
+echo "Please enter your eks name:"
+read eks_name
+
+aws eks update-kubeconfig --region $eks_region --name $eks_name
+
+###########################argocd################################
+
+# ArgoCD namespace 생성
+kubectl create namespace argocd
+
+# ArgoCD 설치
+# kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/ha/install.yaml
+
+# ArgoCD 설치 (HA 기능 제거)
+kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+
+# 기다리기 (서비스가 준비될 때까지)
+echo "Waiting for the Argo CD services to be ready..."
+kubectl -n argocd wait --for=condition=ready pod -l app.kubernetes.io/name=argocd-server --timeout=300s
+
+# ArgoCD 서비스를 LoadBalancer 타입으로 변경
+kubectl patch svc argocd-server -n argocd -p '{"spec": {"type": "LoadBalancer"}}'
+
+# LoadBalancer의 IP 주소를 얻기 위해 기다림
+sleep 60
+
+# Argo CD CLI 다운로드 및 설치
+curl -sSL -o /usr/local/bin/argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+chmod +x /usr/local/bin/argocd
+
+# 초기 admin 비밀번호 가져오기 
+ARGO_PASSWORD=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d; echo)
+
+# ARGO 서버 주소 가져오기 
+ARGO_SERVER=$(kubectl get svc argocd-server -n argocd --output jsonpath='{.status.loadBalancer.ingress[0].hostname}{.status.loadBalancer.ingress[0].ip}')
+
+echo $ARGO_SERVER 
+
+echo $ARGO_PASSWORD 
+
+if [ ! "$ARGO_SERVER" ] || [ ! "$ARGO_PASSWORD" ]; then
+    echo "Argo server or password is not ready yet"
+    exit 1
+fi
+
+sleep 60 
+
+# 로그인 
+if ! argocd login $ARGO_SERVER:443 --username admin --password $ARGO_PASSWORD --insecure; then
+    echo "Failed to login"
+    exit 1
+fi
+
+# 비밀번호 변경 (새 비밀번호: test1234)
+if ! argocd account update-password --current-password $ARGO_PASSWORD --new-password test1234; then
+    echo "Failed to update password"
+    exit 1
+fi
+
+# 다시 clusterip type 으로
+kubectl patch svc argocd-server -n argocd -p '{"spec": {"type": "ClusterIP"}}'
+
+#########################harbor matching #####################
+
+kubectl create namespace donggu-ns2
+
+kubectl create secret docker-registry regcred --docker-server=its2am.servegame.com --docker-username=admin --docker-password=test1234 --namespace=donggu-ns2
+
+########################### CA 적용 #############################
+
+# Download the YAML file
+curl -O https://raw.githubusercontent.com/kubernetes/autoscaler/master/cluster-autoscaler/cloudprovider/aws/examples/cluster-autoscaler-autodiscover.yaml
+
+# Use sed to replace <YOUR CLUSTER NAME> with eks-cluster
+sed -i 's/<YOUR CLUSTER NAME>/eks-cluster/g' cluster-autoscaler-autodiscover.yaml
+
+# Apply the modified configuration
+kubectl apply -f cluster-autoscaler-autodiscover.yaml
+
+# annotation을 추가
+kubectl -n kube-system annotate deployment.apps/cluster-autoscaler cluster-autoscaler.kubernetes.io/safe-to-evict="false"
+
+########################### prometheus 와 grafana 설치 ###########
+
+# helm 설치 및 원격지 추가
+sudo snap install helm --classic
+
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo add grafana https://grafana.github.io/helm-charts
+helm repo add stable https://charts.helm.sh/stable
+helm repo update
+
+# Prometheus 네임스페이스 생성
+kubectl create namespace prometheus
+
+# Prometheus 와 grafana 설치
+helm install prometheus prometheus-community/kube-prometheus-stack -n prometheus
+helm install grafana grafana/grafana -n prometheus --set adminPassword=test1234
+
+##################### cert manager 사용을 위한 배포 ############
+
+## cert-manager CRDs 설치
+#kubectl apply -f https://github.com/jetstack/cert-manager/releases/download/v1.6.0/cert-manager.crds.yaml
+
+## helm repo에 jetstack 추가
+#helm repo add jetstack https://charts.jetstack.io
+#helm repo update
+
+## cert-manager 설치
+#helm install cert-manager jetstack/cert-manager --namespace cert-manager --create-namespace --version v1.6.0
+
+######## 그라파나, 포르메테우스 노출 위한 nginx-ingress controller 설치 ###########
+
+# YAML 파일 다운로드
+curl https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.6.4/deploy/static/provider/aws/deploy.yaml -o controller_private.yaml
+
+# YAML 파일 수정
+sed -i 's/service.beta.kubernetes.io\/aws-load-balancer-backend-protocol: tcp/service.beta.kubernetes.io\/aws-load-balancer-backend-protocol: http/g' controller_private.yaml
+sed -i '/service.beta.kubernetes.io\/aws-load-balancer-backend-protocol: http/a\    service.beta.kubernetes.io/aws-load-balancer-additional-resource-tags: "Name=prodding-hydra-nginx-ingress-controller"' controller_private.yaml
+sed -i '/service.beta.kubernetes.io\/aws-load-balancer-backend-protocol: http/a\    service.beta.kubernetes.io/aws-load-balancer-ssl-cert: "arn:aws:acm:ap-northeast-1:730087137774:certificate/114e3779-4191-4c84-ae94-c23eba5c177c"' controller_private.yaml
+sed -i '/service.beta.kubernetes.io\/aws-load-balancer-backend-protocol: http/a\    service.beta.kubernetes.io/aws-load-balancer-ssl-ports: "443"' controller_private.yaml
+sed -i 's/targetPort: https/targetPort: http/g' controller_private.yaml
+
+# 권한 변경
+chmod +x controller_private.yaml
+
+kubectl apply -f controller_private.yaml
+
+# 설치 완료 메시지 출력
+echo "nginx-ingress controller 1.6.4 버전이 성공적으로 설치되었습니다."
+
+# ingress-nginx-controller Pod가 Running 상태가 될 때까지 기다림
+while [[ $(kubectl get pods -n ingress-nginx -l app.kubernetes.io/name=ingress-nginx2 -o 'jsonpath={..status.conditions[?(@.type=="Ready")].status}') != "True" ]]; do echo "waiting for pod" && sleep 1; done
+
+# private.yaml 파일 생성
+cat << EOF > private.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: dong-ingress
+  namespace: prometheus
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      allow 58.122.11.142/32;
+      deny all;
+spec:
+  rules:
+  - host: jp-gf.kakao-commit.site
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: prometheus-grafana
+            port:
+              number: 80
+  - host: jp-pm.kakao-commit.site
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: prometheus-kube-prometheus-prometheus
+            port:
+              number: 9090
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: argocd-ingress
+  namespace: argocd
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+spec:
+  rules:
+  - host: jp-cd.kakao-commit.site
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: argocd-server
+            port:
+              number: 443
+EOF
+
+echo "private.yaml 파일이 성공적으로 생성되었습니다."
+# private.yaml 내용을 Kubernetes에 적용
+chmod +x private.yaml
+kubectl apply -f private.yaml
+
+# 적용이 완료되었는지 확인
+echo " 1. node 확인 "
+kubectl get node
+echo ""
+echo " 2. namespace 확인"
+kubectl get namespaces | grep -E 'argo|donggu-ns|ingress-nginx|prometheus'
+echo ""
+echo " 3. 인그레스 확인 "
+kubectl get ingress -A
+echo ""
+echo " 4. ingress-nginx 컨트롤러 설치 확인"
+kubectl get pods -n ingress-nginx
+echo ""
+echo " 5. argocd pod확인"
+kubectl get pod -n argocd
+echo ""
+echo " 6. argocd svc확인"
+kubectl get svc -n argocd | grep -E '^argocd-server\s'
+echo ""
+echo " 7. 그라파나&프로메테우스 확인"
+kubectl get svc -n prometheus | grep -E 'grafana|prometheus-grafana'
+echo ""
+echo " 8. 설치된 CA 확인"
+kubectl get pods -n kube-system | grep cluster-autoscaler
+echo ""
+echo " 9. harbor secret 확인(namespace donggu-ns2)"
+kubectl get secret -n donggu-ns2 | grep regcred

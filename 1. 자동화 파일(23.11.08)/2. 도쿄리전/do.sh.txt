@@ -1,0 +1,298 @@
+#!/bin/bash
+
+# 스크립트에서 에러 발생 시 중단
+set -e
+
+# 볼륨 마운트
+
+# lsblk 명령의 출력에서 "nvme1n1" 문자열을 찾습니다.
+output=$(lsblk | grep "nvme1n1")
+
+# "nvme1n1" 문자열이 있으면 스크립트를 계속 진행합니다.
+if [[ ! -z $output ]]; then
+    echo "'nvme1n1' exists. Continue the script."
+    # 여기에 계속 진행할 스크립트를 작성하세요.
+
+# "nvme1n1" 문자열이 없으면 스크립트를 중지합니다.
+else
+    echo "'nvme1n1' does not exist. Stop the script."
+    exit 0
+fi
+
+sudo mkfs -t ext4 /dev/nvme1n1
+
+sudo mkdir /donggu
+
+sudo chown root:root /donggu
+
+sudo mount /dev/nvme1n1 /donggu
+
+# UFW 방화벽 서비스 중지 및 비활성화
+sudo systemctl stop ufw
+sudo systemctl disable ufw
+
+# 도커 설치
+sudo apt update
+sudo apt install -y apt-transport-https ca-certificates curl software-properties-common
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+sudo apt update
+sudo apt install -y docker-ce docker-ce-cli containerd.io
+
+# 도커 서비스 시작 및 부팅 시 자동 시작 설정, 현재 사용자를 docker 그룹에 추가 
+sudo systemctl start docker
+sudo systemctl enable docker 
+docker --version  # 도커 버전 확인 (선택 사항)
+# 수정: 'your_username'을 실제 사용자 이름으로 바꿔주세요.
+sudo usermod -aG docker $USER  
+
+# 도커 컴포즈 설치 
+sudo curl -L "https://github.com/docker/compose/releases/download/1.29.2/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose 
+chmod +x /usr/local/bin/docker-compose 
+docker-compose --version  # 도커 컴포즈 버전 확인 (선택 사항)
+
+# 생성한 인스턴스의 IP를 환경변수로 사용 
+export EC2_PUBLIC_IP=$(curl http://checkip.amazonaws.com/)
+
+# nginx 설치 및 실행.
+sudo apt-get install -y nginx  
+systemctl start nginx 
+
+# Certbot 설치 및 인증서 발급 (Nginx 플러그인을 이용)
+apt-get install -y certbot python3-certbot-nginx  
+
+sudo certbot --nginx --noninteractive --agree-tos --email bagmy2@gmail.com --domain its2am.servegame.com 
+sudo certbot --nginx --noninteractive --agree-tos --email roundface209@gmail.com --domain dnshost2.ddns.net
+
+# 새로운 letsencrypt 디렉토리를 EBS 볼륨에 생성
+sudo mkdir /donggu/letsencrypt
+
+# 원래의 위치(/etc)에서 새로운 위치(/donggu)로 파일들을 복사
+sudo cp -r /etc/letsencrypt/* /donggu/letsencrypt/
+
+# 원래의 위치(/etc)에서 새로운 위치(/donggu)로 symbolic link를 생성
+sudo ln -sfn /donggu/letsencrypt /etc/letsencrypt
+
+# Nginx 설정 파일 생성 또는 업데이트
+cat <<'EOL' | sudo tee /etc/nginx/sites-available/default > /dev/null
+server {
+    listen 80;
+    server_name its2am.servegame.com;
+
+    location /jenkins/ {
+        proxy_pass http://localhost:2000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+
+    location / {
+        proxy_pass http://localhost:3000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}
+
+server {
+    listen 80;
+    server_name dnshost2.ddns.net;
+    return 301 https://$host$request_uri; # HTTP 요청을 HTTPS로 리디렉션
+}
+
+server {
+    listen 443 ssl;
+    server_name its2am.servegame.com;
+
+    ssl_certificate /etc/letsencrypt/live/its2am.servegame.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/its2am.servegame.com/privkey.pem;
+
+    location /jenkins/ {
+        proxy_pass http://localhost:2000/jenkins/;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+
+    location / {
+        proxy_pass http://localhost:3000/;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}
+
+server {
+    listen 443 ssl;
+    server_name dnshost2.ddns.net;
+
+    ssl_certificate /etc/letsencrypt/live/dnshost2.ddns.net/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/dnshost2.ddns.net/privkey.pem;
+
+    location / {
+        proxy_pass http://localhost:1000; # 웹 애플리케이션의 주소로 변경
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}
+EOL
+
+# Nginx 설정 파일이 제대로 작성되었는지 확인
+sudo nginx -t
+
+# Nginx 다시로드하여 변경 내용 적용
+systemctl restart nginx && nginx -s reload
+
+
+########################harbor########################
+
+# Harbor 설치 파일 다운로드 및 압축 해제
+cd ~
+wget https://github.com/goharbor/harbor/releases/download/v2.7.3/harbor-online-installer-v2.7.3.tgz
+tar xvf harbor-online-installer-v2.7.3.tgz
+rm harbor-online-installer-v2.7.3.tgz
+
+# data 저장소 매핑
+mkdir -p /donggu/data
+
+# Docker data root 설정 변경하기 위한 daemon.json 파일 생성/수정 
+sudo mkdir -p /etc/docker/
+echo '{
+  "data-root": "/donggu/data",
+  "insecure-registries" : ["its2am.servegame.com:3000"]
+}' | sudo tee /etc/docker/daemon.json > /dev/null
+
+# docker 서비스 재시작 
+sudo systemctl restart docker
+
+# harbor 디렉터리로 이동
+cd harbor/
+
+# harbor.yml.tmpl 파일 수정 (hostname, port, admin password 등 변경)
+sed -i 's/hostname: .*/hostname: its2am.servegame.com/' harbor.yml.tmpl
+sed -i 's/port: .*/port: 3000/' harbor.yml.tmpl
+sed -i 's/harbor_admin_password: .*/harbor_admin_password: test1234/' harbor.yml.tmpl 
+sed -i 's/password: .*/password: test1234/' harbor.yml.tmpl 
+
+# 13번째부터 18번째 줄까지 주석 처리 (불필요한 구성 제거)
+sed -i '13,18s/^/#/' harbor.yml.tmpl
+
+# 설정 파일 복사 및 설치 스크립트 실행 
+cp harbor.yml.tmpl harbor.yml
+
+./install.sh --with-chartmuseum --with-trivy
+
+########################gitlab########################
+
+# Docker 이미지 다운로드
+docker pull gitlab/gitlab-ce:latest
+
+# GitLab 설정 디렉토리 및 파일 생성
+mkdir -p ~/gitlab
+cd ~/gitlab
+cat <<EOL > docker-compose.yaml
+version: '3.6'
+
+services:
+  gitlab:
+    image: 'gitlab/gitlab-ce:latest'
+    container_name: gitlab
+    restart: always
+
+    environment:
+      GITLAB_OMNIBUS_CONFIG: |
+        external_url 'http://dnshost2.ddns.net'
+        gitlab_rails['gitlab_shell_ssh_port'] = 1022
+        nginx['client_max_body_size'] = '0' # unlimited file size
+
+    ports:
+      - "1000:80"
+      - "1022:22"
+
+    volumes:
+      - '/donggu/gitlab/config:/etc/gitlab'
+      - '/donggu/gitlab/logs:/var/log/gitlab'
+      - '/donggu/gitlab/data:/var/opt/gitlab'
+
+    networks:
+      - ci_default
+
+networks:
+  ci_default:
+
+EOL
+
+# Docker Compose를 사용하여 GitLab 컨테이너 시작
+docker-compose up -d
+
+# Wait for the database to be ready
+echo "Waiting for GitLab to be ready..."
+until $(curl --output /dev/null --silent --head --fail http://localhost:1000); do
+    printf '.'
+    sleep 5
+done
+
+# GitLab 초기 비밀번호 변경(이부분은 초기에만 사용하고 이후 데이터 백업할 땐 안해도 된다.)
+docker exec gitlab /bin/bash -c "gitlab-rails runner \"user = User.where(id: 1).first; user.password = 'test1234'; user.password_confirmation = 'test1234'; user.save!\""
+
+########################jenkins########################
+
+# Jenkins 설정 디렉토리 생성
+cd ~ 
+mkdir -p jenkins
+cd jenkins/
+
+# entrypoint.sh 파일 생성 및 내용 작성
+cat << 'EOF' > entrypoint.sh
+#!/bin/bash
+
+DOCKER_HOST_GID=$(stat -c '%g' /var/run/docker.sock)
+
+if ! getent group $DOCKER_HOST_GID > /dev/null; then
+    groupadd -g ${DOCKER_HOST_GID} docker || true 
+fi
+
+if ! id -nG "$USER" | grep -qw "docker"; then 
+    usermod -aG $DOCKER_HOST_GID jenkins || true 
+fi
+
+exec tini -- /usr/local/bin/jenkins.sh "$@"
+EOF
+
+chmod +x entrypoint.sh  # Make the script executable
+
+# Jenkins volume 디렉토리 생성 및 소유권 변경
+mkdir -p /donggu/jenkins/volume
+sudo chown -R 1000:1000 /donggu/jenkins/volume
+
+
+# docker-compose.yaml 파일 생성 및 내용 작성
+cat << 'EOL' > docker-compose.yaml
+version: '3'
+services:
+  jenkins:
+    restart: always
+    container_name: jenkins
+    image: dorong9/kakao_last_pj:v11  
+    ports:
+      - "2000:8080"
+    volumes:
+      - "/donggu/jenkins/volume:/var/jenkins_home"
+      - "/var/run/docker.sock:/var/run/docker.sock"
+      - "./entrypoint.sh:/entrypoint.sh"
+    environment:
+      TZ: Asia/Seoul
+      JENKINS_OPTS: "--prefix=/jenkins"  
+    command: >
+      /bin/sh -c "
+        sudo chown jenkins /var/run/docker.sock &&
+        /entrypoint.sh"
+
+    networks:
+      - ci_default
+
+networks:
+  ci_default:
+
+EOL
+
+# Docker Compose를 사용하여 Jenkins 컨테이너 시작하기.
+docker-compose up -d
+
+echo "Script execution completed."
